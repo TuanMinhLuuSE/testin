@@ -1,4 +1,4 @@
-name: "Notify Discord on PR Events"
+name: "Notify Discord on PR Events (.NET)"
 
 on:
   pull_request:
@@ -8,56 +8,99 @@ jobs:
   notify:
     runs-on: ubuntu-latest
     steps:
-      - name: Send PR event to Discord
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Send PR event to Discord via .NET
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           GITHUB_EVENT_PATH: ${{ github.event_path }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
-          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           GITHUB_ACTOR: ${{ github.actor }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-        shell: pwsh
         run: |
-          $webhook = $env:DISCORD_WEBHOOK
-          if (-not $webhook) {
-            Write-Error "Discord webhook URL not set in secrets."
-            exit 1
-          }
+          echo 'using System;
+          using System.IO;
+          using System.Net.Http;
+          using System.Text;
+          using System.Text.Json;
+          using System.Threading.Tasks;
 
-          $payload = Get-Content $env:GITHUB_EVENT_PATH | ConvertFrom-Json
-          if ($env:GITHUB_EVENT_NAME -ne "pull_request") {
-            Write-Host "Event is not a pull request. Skipping."
-            exit 0
-          }
+          class Program {
+              static async Task Main() {
+                  var webhook = Environment.GetEnvironmentVariable("DISCORD_WEBHOOK");
+                  if (string.IsNullOrWhiteSpace(webhook)) {
+                      Console.Error.WriteLine("Missing Discord webhook secret");
+                      Environment.Exit(1);
+                  }
 
-          $action = $payload.action
-          $pr = $payload.pull_request
-          $prTitle = $pr.title
-          $prNumber = $pr.number
-          $prUrl = $pr.html_url
-          $prUser = $pr.user.login
-          $repo = $env:GITHUB_REPO
-          $actor = $env:GITHUB_ACTOR
-          $runUrl = "https://github.com/$repo/actions/runs/$($env:GITHUB_RUN_ID)"
+                  var eventName = Environment.GetEnvironmentVariable("GITHUB_EVENT_NAME");
+                  if (eventName != "pull_request") {
+                      Console.WriteLine("Not a PR event, skipping.");
+                      return;
+                  }
 
-          switch ($action) {
-            "opened"          { $color = 3066993 }   # green
-            "closed"          { $color = 15158332 }  # red
-            "reopened"        { $color = 3447003 }   # blue
-            "synchronize"     { $color = 15844367 }  # yellow
-            default            { $color = 9807270 }   # gray
-          }
+                  var path = Environment.GetEnvironmentVariable("GITHUB_EVENT_PATH");
+                  if (!File.Exists(path)) {
+                      Console.Error.WriteLine("Missing GitHub event payload.");
+                      Environment.Exit(1);
+                  }
 
-          $body = @{
-            username = "GitHub Actions"
-            embeds = @(@{
-              title = "Pull Request #$prNumber: $prTitle"
-              url = $prUrl
-              description = "**Action:** `$action`\n**Author:** `$prUser`\n**Triggered by:** `$actor`\n[View workflow run]($runUrl)"
-              color = $color
-              timestamp = (Get-Date).ToUniversalTime().ToString("o")
-            })
-          } | ConvertTo-Json -Depth 5
+                  var json = await File.ReadAllTextAsync(path);
+                  using var doc = JsonDocument.Parse(json);
+                  var action = doc.RootElement.GetProperty("action").GetString();
+                  var pr = doc.RootElement.GetProperty("pull_request");
+                  var prTitle = pr.GetProperty("title").GetString();
+                  var prNumber = pr.GetProperty("number").GetInt32();
+                  var prUrl = pr.GetProperty("html_url").GetString();
+                  var prUser = pr.GetProperty("user").GetProperty("login").GetString();
 
-          $response = Invoke-RestMethod -Uri $webhook -Method POST -Body $body -ContentType "application/json"
-          Write-Host "✅ Discord notification sent for PR #$prNumber ($action)"
+                  var repo = Environment.GetEnvironmentVariable("GITHUB_REPOSITORY");
+                  var actor = Environment.GetEnvironmentVariable("GITHUB_ACTOR");
+                  var runId = Environment.GetEnvironmentVariable("GITHUB_RUN_ID");
+                  var runUrl = $"https://github.com/{repo}/actions/runs/{runId}";
+
+                  var color = action switch {
+                      "opened" => 3066993,
+                      "closed" => 15158332,
+                      "reopened" => 3447003,
+                      "synchronize" => 15844367,
+                      _ => 9807270
+                  };
+
+                  var payload = new {
+                      username = "GitHub Actions",
+                      embeds = new[] {
+                          new {
+                              title = $"Pull Request #{prNumber}: {prTitle}",
+                              url = prUrl,
+                              description = $"**Action:** `{action}`\\n**Author:** `{prUser}`\\n**Triggered by:** `{actor}`\\n[View workflow run]({runUrl})",
+                              color,
+                              timestamp = DateTime.UtcNow.ToString("o")
+                          }
+                      }
+                  };
+
+                  var payloadJson = JsonSerializer.Serialize(payload);
+                  using var http = new HttpClient();
+                  var content = new StringContent(payloadJson, Encoding.UTF8, "application/json");
+                  var response = await http.PostAsync(webhook, content);
+
+                  if (response.IsSuccessStatusCode)
+                      Console.WriteLine($"✅ Sent PR event '{action}' to Discord.");
+                  else
+                      Console.Error.WriteLine($"❌ Failed to send Discord message: {response.StatusCode}");
+              }
+          }' > Program.cs
+
+          dotnet new console -n NotifyDiscord -o app --framework net8.0 --no-restore
+          mv Program.cs app/Program.cs
+          cd app
+          dotnet add package System.Net.Http.Json --no-restore
+          dotnet build --no-restore --nologo
+          dotnet run --no-build

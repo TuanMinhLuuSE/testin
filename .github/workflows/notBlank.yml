@@ -1,0 +1,63 @@
+name: "Notify Discord on PR Events"
+
+on:
+  pull_request:
+    types: [opened, reopened, closed, synchronize, ready_for_review, converted_to_draft, edited, labeled, unlabeled]
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send PR event to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        shell: pwsh
+        run: |
+          $webhook = $env:DISCORD_WEBHOOK
+          if (-not $webhook) {
+            Write-Error "Discord webhook URL not set in secrets."
+            exit 1
+          }
+
+          $payload = Get-Content $env:GITHUB_EVENT_PATH | ConvertFrom-Json
+          if ($env:GITHUB_EVENT_NAME -ne "pull_request") {
+            Write-Host "Event is not a pull request. Skipping."
+            exit 0
+          }
+
+          $action = $payload.action
+          $pr = $payload.pull_request
+          $prTitle = $pr.title
+          $prNumber = $pr.number
+          $prUrl = $pr.html_url
+          $prUser = $pr.user.login
+          $repo = $env:GITHUB_REPO
+          $actor = $env:GITHUB_ACTOR
+          $runUrl = "https://github.com/$repo/actions/runs/$($env:GITHUB_RUN_ID)"
+
+          switch ($action) {
+            "opened"          { $color = 3066993 }   # green
+            "closed"          { $color = 15158332 }  # red
+            "reopened"        { $color = 3447003 }   # blue
+            "synchronize"     { $color = 15844367 }  # yellow
+            default            { $color = 9807270 }   # gray
+          }
+
+          $body = @{
+            username = "GitHub Actions"
+            embeds = @(@{
+              title = "Pull Request #$prNumber: $prTitle"
+              url = $prUrl
+              description = "**Action:** `$action`\n**Author:** `$prUser`\n**Triggered by:** `$actor`\n[View workflow run]($runUrl)"
+              color = $color
+              timestamp = (Get-Date).ToUniversalTime().ToString("o")
+            })
+          } | ConvertTo-Json -Depth 5
+
+          $response = Invoke-RestMethod -Uri $webhook -Method POST -Body $body -ContentType "application/json"
+          Write-Host "✅ Discord notification sent for PR #$prNumber ($action)"
